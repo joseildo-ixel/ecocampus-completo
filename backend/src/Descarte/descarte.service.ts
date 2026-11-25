@@ -1,0 +1,312 @@
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { DataSource, Repository } from 'typeorm';
+import { createPageResponse } from '../common/dto/page-query.dto';
+import { isUniqueConstraintViolation } from '../common/database-errors';
+import { Coletor } from '../coletor/entities/coletor.entity';
+import { Objeto } from '../objetos/entities/objeto.entity';
+import { DescarteItem } from '../objetos/entities/descarte-item.entity';
+import { Usuario } from '../usuario/entities/usuario.entity';
+import { CreateDescarteDto } from './dto/create-descarte.dto';
+import { DescarteResponseDto } from './dto/descarte-response.dto';
+import { ListDescartesQueryDto } from './dto/list-descartes-query.dto';
+import { UpdateDescarteDto } from './dto/update-descarte.dto';
+import { Descarte } from './entities/descarte.entity';
+import { DescarteStatus } from '../common/enums/descarte-status.enum';
+
+@Injectable()
+export class DescarteService {
+  constructor(
+    @InjectRepository(Descarte)
+    private readonly descartes: Repository<Descarte>,
+    private readonly dataSource: DataSource,
+  ) {}
+
+  async create(dto: CreateDescarteDto): Promise<DescarteResponseDto> {
+    let descarteId: string;
+    try {
+      descarteId = await this.dataSource.transaction(async (manager) => {
+        const usuarios = manager.getRepository(Usuario);
+        const coletores = manager.getRepository(Coletor);
+        const objetos = manager.getRepository(Objeto);
+        const descartesRepo = manager.getRepository(Descarte);
+        const itens = manager.getRepository(DescarteItem);
+
+        const usuario = await usuarios.findOneBy({ id: dto.usuarioId });
+        if (!usuario) {
+          throw new NotFoundException(
+            `Usuário ${dto.usuarioId} não encontrado`,
+          );
+        }
+
+        const coletor = await coletores.findOne({
+          where: { id: dto.coletorId },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (!coletor) {
+          throw new NotFoundException(
+            `Coletor ${dto.coletorId} não encontrado`,
+          );
+        }
+        if (!coletor.ativo) {
+          throw new BadRequestException('O coletor está inativo');
+        }
+
+        const quantidadeTotalItens = dto.itens?.length
+          ? dto.itens.reduce((total, item) => total + item.quantidade, 0)
+          : 1;
+        const volumeAtual = Number(coletor.volumeAtual);
+        const capacidade = Number(coletor.capacidadeMaxima);
+        if (volumeAtual + quantidadeTotalItens > capacidade || volumeAtual + quantidadeTotalItens > 30) {
+          throw new BadRequestException(
+            'O descarte excede a capacidade máxima de itens do coletor (máximo de 30 itens).',
+          );
+        }
+
+        const itemObjectIds = (dto.itens ?? []).map((item) => item.objetoId);
+        if (new Set(itemObjectIds).size !== itemObjectIds.length) {
+          throw new BadRequestException(
+            'Cada objeto pode aparecer apenas uma vez na lista de itens',
+          );
+        }
+        const objectsById = new Map<string, Objeto>();
+        for (const objetoId of itemObjectIds) {
+          const objeto = await objetos.findOneBy({ id: objetoId });
+          if (!objeto) {
+            throw new NotFoundException(`Objeto ${objetoId} não encontrado`);
+          }
+          if (!objeto.ativo) {
+            throw new BadRequestException(`Objeto ${objetoId} está inativo`);
+          }
+          objectsById.set(objetoId, objeto);
+        }
+
+        const novoDescarte = descartesRepo.create({
+          status: dto.status ?? DescarteStatus.PENDENTE,
+          dataDescarte: dto.dataDescarte
+            ? new Date(dto.dataDescarte)
+            : new Date(),
+          pesoKg: dto.pesoKg ?? 0,
+          tipoResiduo: dto.tipoResiduo,
+          destino: dto.destino,
+          observacoes: dto.observacoes ?? null,
+          usuarioId: dto.usuarioId,
+          coletorId: dto.coletorId,
+        });
+
+        const descarteSalvo = await descartesRepo.save(novoDescarte);
+
+        if (dto.itens?.length) {
+          await itens.save(
+            dto.itens.map((item) =>
+              itens.create({
+                descarteId: descarteSalvo.id,
+                objetoId: item.objetoId,
+                quantidade: item.quantidade,
+                objeto: objectsById.get(item.objetoId),
+              }),
+            ),
+          );
+        }
+
+        coletor.volumeAtual = volumeAtual + quantidadeTotalItens;
+        await coletores.save(coletor);
+
+        return descarteSalvo.id;
+      });
+    } catch (error) {
+      if (isUniqueConstraintViolation(error)) {
+        throw new ConflictException(
+          'O descarte contém objetos repetidos',
+        );
+      }
+      throw error;
+    }
+    return this.findOne(descarteId);
+  }
+
+  async findAll(query: ListDescartesQueryDto) {
+    const { page, limit } = query;
+    const builder = this.descartes
+      .createQueryBuilder('descarte')
+      .leftJoinAndSelect('descarte.itens', 'item')
+      .leftJoinAndSelect('item.objeto', 'objeto')
+      .leftJoinAndSelect('descarte.usuario', 'usuario');
+    if (query.status) {
+      builder.andWhere('descarte.status = :status', { status: query.status });
+    }
+    if (query.tipoResiduo) {
+      builder.andWhere('descarte.tipoResiduo = :tipoResiduo', {
+        tipoResiduo: query.tipoResiduo,
+      });
+    }
+    if (query.usuarioId) {
+      builder.andWhere('descarte.usuarioId = :usuarioId', {
+        usuarioId: query.usuarioId,
+      });
+    }
+    if (query.coletorId) {
+      builder.andWhere('descarte.coletorId = :coletorId', {
+        coletorId: query.coletorId,
+      });
+    }
+    const [descartes, total] = await builder
+      .orderBy('descarte.dataCriacao', 'DESC')
+      .skip((page - 1) * limit)
+      .take(limit)
+      .getManyAndCount();
+    return createPageResponse(
+      descartes.map((descarte) => this.toResponse(descarte)),
+      total,
+      page,
+      limit,
+    );
+  }
+
+  async findOne(id: string): Promise<DescarteResponseDto> {
+    const descarte = await this.descartes.findOne({
+      where: { id },
+      relations: { usuario: true, itens: { objeto: true } },
+    });
+    if (!descarte) {
+      throw new NotFoundException(`Descarte ${id} não encontrado`);
+    }
+    return this.toResponse(descarte);
+  }
+
+  async update(
+    id: string,
+    dto: UpdateDescarteDto,
+  ): Promise<DescarteResponseDto> {
+    await this.dataSource.transaction(async (manager) => {
+      const descartes = manager.getRepository(Descarte);
+      const descarte = await descartes.findOne({
+        where: { id },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!descarte) {
+        throw new NotFoundException(`Descarte ${id} não encontrado`);
+      }
+
+      const newStatus = dto.status ?? descarte.status;
+      const disposalItems = await manager
+        .getRepository(DescarteItem)
+        .find({ where: { descarteId: descarte.id } });
+      const quantity = disposalItems.length
+        ? disposalItems.reduce((total, item) => total + item.quantidade, 0)
+        : 1;
+      const currentContribution = descarte.status === 'finalizado' ? 0 : quantity;
+      const updatedContribution = newStatus === 'finalizado' ? 0 : quantity;
+      const quantityDelta = updatedContribution - currentContribution;
+      if (quantityDelta !== 0 && descarte.coletorId) {
+        const coletores = manager.getRepository(Coletor);
+        const coletor = await coletores.findOne({
+          where: { id: descarte.coletorId },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (coletor) {
+          const volumeAtual = Number(coletor.volumeAtual);
+          const novoVolume = volumeAtual + quantityDelta;
+          if (novoVolume < 0) {
+            throw new ConflictException(
+              'A quantidade de itens do coletor não corresponde aos descartes ativos',
+            );
+          }
+          if (novoVolume > Number(coletor.capacidadeMaxima) || novoVolume > 30) {
+            throw new BadRequestException(
+              'A atualização excede a capacidade máxima de itens do coletor (máximo de 30 itens).',
+            );
+          }
+          coletor.volumeAtual = novoVolume;
+          await coletores.save(coletor);
+        }
+      }
+      await descartes.save(descartes.merge(descarte, dto));
+    });
+    return this.findOne(id);
+  }
+
+  async remove(id: string): Promise<{ id: string; deleted: true }> {
+    await this.dataSource.transaction(async (manager) => {
+      const descartes = manager.getRepository(Descarte);
+      const descarte = await descartes.findOne({
+        where: { id },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!descarte) {
+        throw new NotFoundException(`Descarte ${id} não encontrado`);
+      }
+      if (descarte.coletorId && descarte.status !== 'finalizado') {
+        const disposalItems = await manager
+          .getRepository(DescarteItem)
+          .find({ where: { descarteId: descarte.id } });
+        const quantity = disposalItems.length
+          ? disposalItems.reduce((total, item) => total + item.quantidade, 0)
+          : 1;
+        const coletores = manager.getRepository(Coletor);
+        const coletor = await coletores.findOne({
+          where: { id: descarte.coletorId },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (coletor) {
+          coletor.volumeAtual = Math.max(0, Number(coletor.volumeAtual) - quantity);
+          await coletores.save(coletor);
+        }
+      }
+      await descartes.remove(descarte);
+    });
+    return { id, deleted: true };
+  }
+
+  private toResponse(descarte: Descarte): DescarteResponseDto {
+    return {
+      id: descarte.id,
+      status: descarte.status,
+      dataDescarte: descarte.dataDescarte,
+      pesoKg: Number(descarte.pesoKg),
+      tipoResiduo: descarte.tipoResiduo,
+      destino: descarte.destino,
+      observacoes: descarte.observacoes ?? null,
+      dataCriacao: descarte.dataCriacao,
+      usuarioId: descarte.usuarioId,
+      ...(descarte.usuario
+        ? {
+            usuario: {
+              id: descarte.usuario.id,
+              nome: descarte.usuario.nome,
+              email: descarte.usuario.email,
+            },
+          }
+        : {}),
+      coletorId: descarte.coletorId ?? null,
+      itens: (descarte.itens ?? []).map((item) => ({
+        id: item.id,
+        objetoId: item.objetoId,
+        quantidade: item.quantidade,
+        objeto: {
+          nome: item.objeto.nome,
+          tipo: item.objeto.tipo,
+          pesoKg: Number(item.objeto.pesoKg),
+        },
+      })),
+    };
+  }
+  async gerarRelatorioCompleto(): Promise<Descarte[]> {
+    return await this.descartes
+      .createQueryBuilder('descarte')
+      // Traz os itens do descarte e os detalhes físicos dos objetos
+      .leftJoinAndSelect('descarte.itens', 'item')
+      .leftJoinAndSelect('item.objeto', 'objeto')
+      // Traz os dados do usuário que fez o descarte
+      .leftJoinAndSelect('descarte.usuario', 'usuario')
+      // Traz os dados do coletor que recebeu o descarte
+      .leftJoinAndSelect('descarte.coletor', 'coletor')
+      .orderBy('descarte.dataCriacao', 'DESC')
+      .getMany();
+  }
+}
